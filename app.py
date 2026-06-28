@@ -10,6 +10,8 @@ Educational tool, NOT financial advice. Most candidates will not rally.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 import streamlit as st
 
@@ -20,34 +22,69 @@ from src.apewisdom import scan as scan_social
 from src.market_scanner import scan_market
 from src.scoring import build_candidate, WEIGHTS
 
-
-def _cached_fundamentals(sym: str) -> Fundamentals:
-    """Reuse a successful fundamentals fetch across re-runs to dodge yfinance
-    rate limits. Failures are NOT cached, so a re-run retries them."""
-    cache = st.session_state.setdefault("fund_cache", {})
-    if sym in cache:
-        return cache[sym]
-    f = fetch_fundamentals(sym)
-    if f.ok:
-        cache[sym] = f
-    return f
+# Deep-analysis is pure network I/O, so fetch tickers concurrently. Kept modest
+# to stay friendly to yfinance/SEC rate limits while still cutting wall-clock ~6x.
+MAX_WORKERS = 6
 
 
-def _cached_breakout(sym: str) -> Breakout:
-    cache = st.session_state.setdefault("breakout_cache", {})
-    if sym in cache:
-        return cache[sym]
-    b = fetch_breakout(sym)
-    if b.ok:
-        cache[sym] = b
-    return b
+@st.cache_data(ttl=300, show_spinner=False)
+def _social_buzz(pages: int = 2):
+    """ApeWisdom buzz, cached 5 min so re-running a scan doesn't re-pull it."""
+    return scan_social(flt="all-stocks", pages=pages)
 
 
-def _cached_catalyst(sym: str):
-    cache = st.session_state.setdefault("catalyst_cache", {})
-    if sym not in cache:
-        cache[sym] = fetch_catalyst(sym)
-    return cache[sym]
+def _gather(sym, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache):
+    """Fetch all per-ticker signals for one symbol. PURE + thread-safe: it only
+    *reads* the cache dicts (never mutates them or st.session_state), so it's
+    safe to run in a worker thread. The main thread writes results back."""
+    mv = movers_by_symbol.get(sym)
+    if mv is not None:  # reuse the market-scan breakout — no extra network call
+        b = Breakout(sym, mv.rvol, None, mv.ret_5d, mv.pct_of_high, mv.last_close, ok=True)
+    else:
+        b = breakout_cache.get(sym) or fetch_breakout(sym)
+    f = fund_cache.get(sym) or fetch_fundamentals(sym)
+    cat = catalyst_cache.get(sym) or fetch_catalyst(sym)
+    return sym, b, f, cat
+
+
+def _column_config():
+    """Rich formatting for the results table — score bars, currency, % and links."""
+    return {
+        "Rally Score": st.column_config.ProgressColumn(
+            "Rally Score", min_value=0, max_value=100, format="%.0f",
+            help="0-100 rally readiness. See 'How the Rally Score is calculated'."),
+        "Theme Score*": st.column_config.ProgressColumn(
+            "Theme*", min_value=0, max_value=100, format="%.0f",
+            help="SPECULATIVE emerging-theme heuristic — NOT a prediction."),
+        "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+        "RVOL": st.column_config.NumberColumn("RVOL", format="%.2f", help="Volume vs 20-day avg"),
+        "5d %": st.column_config.NumberColumn("5d %", format="%.1f%%"),
+        "Float (M)": st.column_config.NumberColumn("Float (M)", format="%.1f"),
+        "Mkt Cap ($M)": st.column_config.NumberColumn("Mkt Cap ($M)", format="%.0f"),
+        "Short %Float": st.column_config.NumberColumn("Short %Float", format="%.1f%%"),
+        "Catalyst": st.column_config.NumberColumn("Catalyst", format="%.0f"),
+        "Reddit mentions": st.column_config.NumberColumn("Mentions", format="%d"),
+        "Research": st.column_config.LinkColumn("Research", display_text="Finviz ↗"),
+    }
+
+
+def _render_results(frame: pd.DataFrame, *, key: str) -> None:
+    """Summary metric cards + formatted, sortable table + CSV export + chart."""
+    if frame.empty:
+        return
+    top = frame.iloc[0]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Candidates", len(frame))
+    c2.metric("Top pick", str(top["Symbol"]), f"{top['Rally Score']:.0f} score")
+    c3.metric("Avg rally score", f"{frame['Rally Score'].mean():.0f}")
+    c4.metric("With catalyst", int((frame["Catalyst"] > 0).sum()))
+
+    st.dataframe(frame, use_container_width=True, hide_index=True,
+                 column_config=_column_config())
+    st.download_button(
+        "⬇️ Download CSV", frame.to_csv(index=False).encode("utf-8"),
+        file_name="rally_candidates.csv", mime="text/csv", key=f"dl_{key}")
+    st.bar_chart(frame.set_index("Symbol")["Rally Score"])
 
 
 st.set_page_config(page_title="Rally Radar", layout="wide")
@@ -131,7 +168,7 @@ if run:
     buzz_by_symbol: dict = {}
     if use_social:
         with st.spinner("Pulling social buzz from ApeWisdom..."):
-            for b in scan_social(flt="all-stocks", pages=2):
+            for b in _social_buzz(pages=2):
                 buzz_by_symbol[b.symbol] = b
         if buzz_by_symbol:
             st.caption(f"Social: {len(buzz_by_symbol)} trending tickers loaded from ApeWisdom.")
@@ -161,41 +198,52 @@ if run:
 
     max_momentum = max((b.momentum for b in buzz_by_symbol.values()), default=1.0)
 
-    # 2) Score each candidate. Fundamentals (yfinance .info) can rate-limit, so
-    #    we degrade gracefully: a candidate is kept and scored on whatever data
-    #    we DO have (breakout from the market scan never needs a re-fetch).
+    # 2) Fetch every candidate's signals CONCURRENTLY (pure network I/O), then
+    #    assemble on the main thread. yfinance .info can rate-limit, so we degrade
+    #    gracefully: a candidate is kept and scored on whatever data we DO have.
+    fund_cache = st.session_state.setdefault("fund_cache", {})
+    breakout_cache = st.session_state.setdefault("breakout_cache", {})
+    catalyst_cache = st.session_state.setdefault("catalyst_cache", {})
+
+    fetched: dict = {}
+    prog = st.progress(0.0, text="Pulling data...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {
+            ex.submit(_gather, s, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache): s
+            for s in symbols
+        }
+        for done, fut in enumerate(as_completed(futures)):
+            sym, b, f, cat = fut.result()
+            fetched[sym] = (b, f, cat)
+            # Cache successes so a re-run reuses them (failures retried next time).
+            if b.ok:
+                breakout_cache[sym] = b
+            if f.ok:
+                fund_cache[sym] = f
+            catalyst_cache.setdefault(sym, cat)
+            prog.progress((done + 1) / len(symbols), text=f"Analyzed {done + 1}/{len(symbols)}...")
+    prog.empty()
+
+    # Assemble candidates in the original symbol order, applying filters.
     candidates = []
     dropped_cap = 0
     no_fundamentals = 0
-    prog = st.progress(0.0, text="Pulling data...")
-    for i, sym in enumerate(symbols):
-        prog.progress((i + 1) / len(symbols), text=f"Analyzing {sym}...")
-
-        # Breakout: reuse the market-scan result if we have it (no extra call).
-        mv = movers_by_symbol.get(sym)
-        if mv is not None:
-            b = Breakout(sym, mv.rvol, None, mv.ret_5d, mv.pct_of_high, mv.last_close, ok=True)
-        else:
-            b = _cached_breakout(sym)
-            if b.ok and b.last_close and b.last_close > max_price:
-                continue
-
-        f = _cached_fundamentals(sym)
+    for sym in symbols:
+        b, f, cat = fetched[sym]
+        if movers_by_symbol.get(sym) is None and b.ok and b.last_close and b.last_close > max_price:
+            continue
         if not f.ok:
             no_fundamentals += 1
             f = Fundamentals(sym, None, None, b.last_close, None, None, None, None, None, None, ok=False)
         if f.market_cap and f.market_cap > max_market_cap_m * 1_000_000:
             dropped_cap += 1
             continue
-
-        cat = _cached_catalyst(sym)
         candidates.append(
             build_candidate(
                 f, b, buzz_by_symbol.get(sym), max_momentum,
                 catalyst=cat.score, catalyst_notes=cat.notes,
             )
         )
-    prog.empty()
 
     if no_fundamentals:
         st.info(f"⚠️ yfinance rate-limited fundamentals for {no_fundamentals} ticker(s) — "
@@ -226,6 +274,7 @@ if run:
                 "Themes": ", ".join(c.theme_tags),
                 "Reddit mentions": c.mentions,
                 "Sector": c.sector,
+                "Research": f"https://finviz.com/quote.ashx?t={c.symbol}",
                 # Helper columns (hidden from display) for the 'well-known' filter.
                 "_mkt_cap": c.market_cap or 0,
                 "_dollar_vol": (c.avg_volume or 0) * (c.last_close or 0),
@@ -247,14 +296,12 @@ if run:
     )
 
     with tab_all:
-        st.subheader(f"🏆 {len(candidates)} candidates ranked by rally readiness")
-        st.caption("RVOL = today's volume vs 20-day avg (>2 = unusual). 5d % = price change over 5 sessions.")
-        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-        st.bar_chart(df.set_index("Symbol")["Rally Score"])
+        st.caption("RVOL = today's volume vs 20-day avg (>2 = unusual). 5d % = price change over 5 sessions. "
+                   "Click any column header to sort.")
+        _render_results(df[display_cols], key="all")
 
     with tab_known:
         known = df[known_mask]
-        st.subheader(f"⭐ {len(known)} well-known candidates")
         st.caption(
             f"Candidates with market cap ≥ ${wellknown_min_cap_m}M and avg daily "
             f"$ volume ≥ ${wellknown_min_dollar_vol_m}M — recognizable, liquid names. "
@@ -265,8 +312,7 @@ if run:
                     "are often larger than this screener's **Max market cap** filter — "
                     "raise that slider (and/or lower the thresholds here) to include them.")
         else:
-            st.dataframe(known[display_cols], use_container_width=True, hide_index=True)
-            st.bar_chart(known.set_index("Symbol")["Rally Score"])
+            _render_results(known[display_cols], key="known")
 
     st.caption(
         "\\*Theme Score is a **speculative** Emerging-Theme heuristic (R&D-style "
