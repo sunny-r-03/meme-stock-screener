@@ -5,9 +5,47 @@ small market cap, high short interest, recent price action.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import yfinance as yf
+
+try:  # yfinance exposes this in recent versions; fall back if absent.
+    from yfinance.exceptions import YFRateLimitError
+except Exception:  # pragma: no cover
+    class YFRateLimitError(Exception):
+        pass
+
+
+def _is_rate_limit(e: Exception) -> bool:
+    msg = str(e).lower()
+    return (
+        isinstance(e, YFRateLimitError)
+        or "rate limit" in msg
+        or "too many requests" in msg
+    )
+
+
+def _ticker_info(symbol: str, retries: int = 4, base_delay: float = 1.5) -> dict:
+    """Fetch yfinance .info, retrying with exponential backoff on rate limits.
+
+    Yahoo throttles aggressively when .info is called in a tight loop, which is
+    what blanks out Float/Market Cap/Short %. A few backed-off retries recover
+    most tickers. Non-rate-limit errors fail fast.
+    """
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return yf.Ticker(symbol).info or {}
+        except Exception as e:  # noqa: BLE001 - want to inspect/route the error
+            last = e
+            if _is_rate_limit(e) and attempt < retries - 1:
+                time.sleep(base_delay * (2 ** attempt))  # 1.5s, 3s, 6s
+                continue
+            break
+    if last is not None:
+        raise last
+    return {}
 
 
 @dataclass
@@ -32,7 +70,7 @@ class Fundamentals:
 
 def fetch(symbol: str) -> Fundamentals:
     try:
-        info = yf.Ticker(symbol).info or {}
+        info = _ticker_info(symbol)
     except Exception:
         return Fundamentals(symbol, None, None, None, None, None, None, None, None, None, ok=False)
 

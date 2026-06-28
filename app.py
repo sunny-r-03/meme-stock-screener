@@ -18,7 +18,37 @@ from src.edgar import fetch as fetch_catalyst
 from src.fundamentals import Fundamentals, fetch as fetch_fundamentals
 from src.apewisdom import scan as scan_social
 from src.market_scanner import scan_market
-from src.scoring import build_candidate
+from src.scoring import build_candidate, WEIGHTS
+
+
+def _cached_fundamentals(sym: str) -> Fundamentals:
+    """Reuse a successful fundamentals fetch across re-runs to dodge yfinance
+    rate limits. Failures are NOT cached, so a re-run retries them."""
+    cache = st.session_state.setdefault("fund_cache", {})
+    if sym in cache:
+        return cache[sym]
+    f = fetch_fundamentals(sym)
+    if f.ok:
+        cache[sym] = f
+    return f
+
+
+def _cached_breakout(sym: str) -> Breakout:
+    cache = st.session_state.setdefault("breakout_cache", {})
+    if sym in cache:
+        return cache[sym]
+    b = fetch_breakout(sym)
+    if b.ok:
+        cache[sym] = b
+    return b
+
+
+def _cached_catalyst(sym: str):
+    cache = st.session_state.setdefault("catalyst_cache", {})
+    if sym not in cache:
+        cache[sym] = fetch_catalyst(sym)
+    return cache[sym]
+
 
 st.set_page_config(page_title="Rally Radar", layout="wide")
 st.title("🚀 Small-Cap Rally Radar")
@@ -27,6 +57,42 @@ st.caption(
     "breakout momentum + attention + thin float + short-interest fuel. "
     "We go long, never short. **Educational only — not financial advice.**"
 )
+
+with st.expander("📊 How the Rally Score is calculated (full details)"):
+    w = WEIGHTS
+    st.markdown(f"""
+The **Rally Score** is a 0–100 blend of six signals. Each signal is scored 0–100
+on its own, then combined with these weights (they sum to 1.0):
+
+| Signal | Weight | What it measures | How it's scored (0–100) |
+|---|---|---|---|
+| **Breakout** | {w['breakout']:.0%} | Is a rally igniting *now*? | See breakdown below |
+| **Social / attention** | {w['social']:.0%} | Is a crowd forming? | This ticker's ApeWisdom *momentum* ÷ the highest momentum seen this scan |
+| **Catalyst** | {w['catalyst']:.0%} | Is there a concrete reason to buy? | SEC EDGAR scan: **+** activist stakes (SC 13D) & recent 8-Ks; **−** dilution filings (S-1/S-3/424B) |
+| **Small float** | {w['smallfloat']:.0%} | *Accelerant* — thin float amplifies buying | ≤8M shares = 100, decaying to 0 by ~150M shares (falls back to market cap if float missing) |
+| **Short interest** | {w['short']:.0%} | *Accelerant* — trapped shorts must buy | % of float short ÷ 20% (20%+ short = max). We BUY these, never short them |
+| **Liquidity** | {w['liquidity']:.0%} | Tradeable sanity check | <50k avg vol = 20, >50M = 40, in-between = 100 |
+
+**Breakout sub-score** (the most important "is it happening now" signal) is itself
+a blend:
+- **40%** Relative Volume (RVOL): today's volume ÷ 20-day average. 3× = max.
+- **35%** 5-day return: price change over 5 sessions. +30% = max. Negative = 0.
+- **25%** Proximity to 60-day high: rewards 0.85 → 1.0+ of the recent high (new highs = no overhead supply).
+
+**Overextension guard:** a stock already up **>40% in 5 days** gets its score
+*dampened* (down to ~0.4× by +120%). Buying a confirmed parabolic move is a
+chase, not an entry — this lost 70%+ in backtests.
+
+---
+
+**🌱 Theme Score** is shown as a **separate** column and is **NOT** part of the
+Rally Score. It's a *speculative* heuristic (theme keyword tags + revenue growth
++ gross margin + attention) and is **not a prediction** of which products will
+succeed. Expect many false positives.
+
+> ⚠️ This ranks rally *readiness* — it does **not** predict prices. Most
+> candidates will not rally. Educational tool, not financial advice.
+""")
 
 DEFAULT_WATCHLIST = "KOSS, GME, AMC, BBBY, ATER, PROG, BB, SPRT, IRNT"
 
@@ -45,7 +111,8 @@ with st.sidebar:
     add_trending = st.checkbox("Also treat trending social tickers as candidates", value=True)
 
     st.header("Filters")
-    max_market_cap_m = st.slider("Max market cap ($M)", 5, 5000, 1000, step=5)
+    max_market_cap_m = st.slider("Max market cap ($M)", 50, 50_000, 1000, step=50)
+    st.caption("Tip: well-known names run big — GME is ~$10B. Raise this to include them.")
     max_price = st.slider("Max share price ($)", 1, 200, 50)
     st.caption("Market-scan breakout thresholds:")
     min_rvol = st.slider("Min relative volume (RVOL)", 1.5, 10.0, 2.5, step=0.5)
@@ -55,7 +122,7 @@ with st.sidebar:
     st.header("⭐ 'Well-known' tab")
     st.caption("Defines which candidates count as well-known (bigger + liquid). "
                "Raise 'Max market cap' above to let large household names through.")
-    wellknown_min_cap_m = st.slider("Min market cap ($M)", 50, 5000, 300, step=50)
+    wellknown_min_cap_m = st.slider("Min market cap ($M)", 50, 50_000, 300, step=50)
     wellknown_min_dollar_vol_m = st.slider("Min avg daily $ volume ($M)", 0.0, 50.0, 1.0, step=0.5)
     run = st.button("🔍 Scan for rallies", type="primary")
 
@@ -109,11 +176,11 @@ if run:
         if mv is not None:
             b = Breakout(sym, mv.rvol, None, mv.ret_5d, mv.pct_of_high, mv.last_close, ok=True)
         else:
-            b = fetch_breakout(sym)
+            b = _cached_breakout(sym)
             if b.ok and b.last_close and b.last_close > max_price:
                 continue
 
-        f = fetch_fundamentals(sym)
+        f = _cached_fundamentals(sym)
         if not f.ok:
             no_fundamentals += 1
             f = Fundamentals(sym, None, None, b.last_close, None, None, None, None, None, None, ok=False)
@@ -121,7 +188,7 @@ if run:
             dropped_cap += 1
             continue
 
-        cat = fetch_catalyst(sym)
+        cat = _cached_catalyst(sym)
         candidates.append(
             build_candidate(
                 f, b, buzz_by_symbol.get(sym), max_momentum,

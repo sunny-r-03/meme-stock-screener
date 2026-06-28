@@ -13,6 +13,7 @@ Components:
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import yfinance as yf
@@ -30,10 +31,17 @@ class Breakout:
 
 
 def fetch(symbol: str) -> Breakout:
-    try:
-        hist = yf.Ticker(symbol).history(period="3mo", interval="1d")
-    except Exception:
-        return Breakout(symbol, None, None, None, None, None, ok=False)
+    hist = None
+    for attempt in range(4):
+        try:
+            hist = yf.Ticker(symbol).history(period="3mo", interval="1d")
+            break
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if ("rate limit" in msg or "too many requests" in msg) and attempt < 3:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            return Breakout(symbol, None, None, None, None, None, ok=False)
 
     if hist is None or hist.empty or len(hist) < 6:
         return Breakout(symbol, None, None, None, None, None, ok=False)
