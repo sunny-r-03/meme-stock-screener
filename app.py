@@ -39,7 +39,8 @@ def _gather(sym, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache):
     safe to run in a worker thread. The main thread writes results back."""
     mv = movers_by_symbol.get(sym)
     if mv is not None:  # reuse the market-scan breakout — no extra network call
-        b = Breakout(sym, mv.rvol, None, mv.ret_5d, mv.pct_of_high, mv.last_close, ok=True)
+        b = Breakout(sym, mv.rvol, None, mv.ret_5d, mv.pct_of_high, mv.last_close,
+                     ok=True, closes=mv.closes)
     else:
         b = breakout_cache.get(sym) or fetch_breakout(sym)
     f = fund_cache.get(sym) or fetch_fundamentals(sym)
@@ -50,6 +51,10 @@ def _gather(sym, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache):
 def _column_config():
     """Rich formatting for the results table — score bars, currency, % and links."""
     return {
+        "🆕": st.column_config.TextColumn("🆕", width="small",
+            help="New candidate since your previous scan this session."),
+        "Trend": st.column_config.LineChartColumn(
+            "Trend (30d)", width="small", help="Recent daily closing price."),
         "Rally Score": st.column_config.ProgressColumn(
             "Rally Score", min_value=0, max_value=100, format="%.0f",
             help="0-100 rally readiness. See 'How the Rally Score is calculated'."),
@@ -73,11 +78,13 @@ def _render_results(frame: pd.DataFrame, *, key: str) -> None:
     if frame.empty:
         return
     top = frame.iloc[0]
-    c1, c2, c3, c4 = st.columns(4)
+    new_n = int((frame["🆕"] == "🆕").sum()) if "🆕" in frame.columns else 0
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Candidates", len(frame))
-    c2.metric("Top pick", str(top["Symbol"]), f"{top['Rally Score']:.0f} score")
-    c3.metric("Avg rally score", f"{frame['Rally Score'].mean():.0f}")
-    c4.metric("With catalyst", int((frame["Catalyst"] > 0).sum()))
+    c2.metric("🆕 New", new_n)
+    c3.metric("Top pick", str(top["Symbol"]), f"{top['Rally Score']:.0f} score")
+    c4.metric("Avg rally score", f"{frame['Rally Score'].mean():.0f}")
+    c5.metric("With catalyst", int((frame["Catalyst"] > 0).sum()))
 
     st.dataframe(frame, use_container_width=True, hide_index=True,
                  column_config=_column_config())
@@ -257,13 +264,23 @@ if run:
 
     candidates.sort(key=lambda c: c.score, reverse=True)
 
+    # 'New since last scan' — diff this scan's symbols against the previous one
+    # (this session). First scan has no baseline, so nothing is flagged new.
+    current_symbols = {c.symbol for c in candidates}
+    prev_symbols = st.session_state.get("prev_scan_symbols")
+    new_symbols = (current_symbols - prev_symbols) if prev_symbols else set()
+    first_scan = prev_symbols is None
+    st.session_state["prev_scan_symbols"] = current_symbols
+
     df = pd.DataFrame(
         [
             {
+                "🆕": "🆕" if c.symbol in new_symbols else "",
                 "Symbol": c.symbol,
                 "Name": c.name,
                 "Rally Score": c.score,
                 "Price": c.last_close,
+                "Trend": c.closes or [],
                 "RVOL": c.rvol,
                 "5d %": c.ret_5d,
                 "Float (M)": round(c.float_shares / 1_000_000, 1) if c.float_shares else None,
@@ -298,6 +315,8 @@ if run:
     with tab_all:
         st.caption("RVOL = today's volume vs 20-day avg (>2 = unusual). 5d % = price change over 5 sessions. "
                    "Click any column header to sort.")
+        if first_scan:
+            st.caption("ℹ️ First scan this session — 🆕 'new' flags appear from your next scan onward.")
         _render_results(df[display_cols], key="all")
 
     with tab_known:

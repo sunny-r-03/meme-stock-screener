@@ -28,6 +28,7 @@ class Breakout:
     pct_of_60d_high: float | None  # close / 60-day high (1.0 = at the high)
     last_close: float | None
     ok: bool = True
+    closes: list[float] | None = None  # recent daily closes, for a sparkline
 
 
 def fetch(symbol: str) -> Breakout:
@@ -68,6 +69,7 @@ def fetch(symbol: str) -> Breakout:
         pct_of_60d_high=round(last_close / high_60, 3) if high_60 else None,
         last_close=round(last_close, 2),
         ok=True,
+        closes=[round(float(x), 2) for x in close.tail(30)],
     )
 
 

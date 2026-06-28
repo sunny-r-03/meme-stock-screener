@@ -56,6 +56,7 @@ class Candidate:
     avg_volume: float | None = None       # for the 'well-known' liquidity proxy
     theme_tags: list[str] = field(default_factory=list)  # speculative, see theme.py
     theme_score: float = 0.0              # 0-100, SPECULATIVE — not a prediction
+    closes: list[float] | None = None     # recent closes, for a sparkline
 
 
 def _social_score(buzz: TickerBuzz | None, max_momentum: float) -> float:
@@ -151,4 +152,5 @@ def build_candidate(
         avg_volume=f.avg_volume,
         theme_tags=theme.tags,
         theme_score=theme.score,
+        closes=b.closes if b.ok else None,
     )

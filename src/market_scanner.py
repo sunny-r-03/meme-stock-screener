@@ -10,7 +10,7 @@ the caller for just these movers — not all 12,000 names.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 import yfinance as yf
@@ -26,6 +26,7 @@ class Mover:
     ret_5d: float        # % price change over 5 sessions
     avg_dollar_vol: float  # liquidity proxy (avg volume * price)
     pct_of_high: float   # close / window high (1.0 = at the high)
+    closes: list[float] = field(default_factory=list)  # recent closes, for a sparkline
 
 
 def _scan_chunk(symbols: list[str]) -> list[Mover]:
@@ -66,6 +67,7 @@ def _scan_chunk(symbols: list[str]) -> list[Mover]:
                     ret_5d=round((last_close / close_5_ago - 1) * 100, 2),
                     avg_dollar_vol=round(avg_vol * last_close, 0),
                     pct_of_high=round(last_close / window_high, 3),
+                    closes=[round(float(x), 2) for x in close.tail(30)],
                 )
             )
         except (KeyError, IndexError, TypeError):
