@@ -1,0 +1,46 @@
+name: Daily Top 10
+
+# Runs after the US market close and commits data/top10.json back to the repo,
+# which the Streamlit app reads. 06:00 UTC = ~1am EST / 2am EDT (GitHub cron is
+# UTC and has no DST, so we pick a time that's safely after close year-round).
+on:
+  schedule:
+    - cron: "0 6 * * 2-6"   # Tue–Sat UTC = after each US trading day (Mon–Fri ET)
+  workflow_dispatch: {}      # allow manual "Run workflow" from the Actions tab
+
+permissions:
+  contents: write            # needed to push the updated JSON
+
+concurrency:
+  group: daily-top10
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build the daily Top 10
+        run: python scripts/build_top10.py
+
+      - name: Commit results if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/top10.json
+          if git diff --staged --quiet; then
+            echo "No change in top10.json."
+          else
+            git commit -m "chore: update daily top 10 [skip ci]"
+            git push
+          fi
