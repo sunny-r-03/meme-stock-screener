@@ -57,6 +57,65 @@ def _gather(sym, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache, u
     return sym, b, f, cat
 
 
+def _render_scan(scan: dict, wk_cap_m: float, wk_vol_m: float) -> None:
+    """Render a stored scan result. Reads from session_state, so it repaints on
+    ANY rerun (tab switch, minimize/reconnect, well-known slider change) without
+    re-running the scan — your results don't vanish when the page reloads."""
+    df = scan["df"]
+    candidates = scan["candidates"]
+    display_cols = display_columns(df)
+
+    st.caption(f"🕒 Showing your last scan ({scan['n']} candidates). Results persist "
+               "across tab switches and reconnects — click **Scan for rallies** to refresh.")
+    if scan["no_fundamentals"]:
+        st.info(f"⚠️ yfinance rate-limited fundamentals for {scan['no_fundamentals']} ticker(s) — "
+                "those are scored on breakout only (float/short/cap blank). Re-scan for full data.")
+
+    # Well-known filter re-applies live from the current sliders (no re-scan).
+    known_mask = (
+        (df["_mkt_cap"] >= wk_cap_m * 1_000_000)
+        & (df["_dollar_vol"] >= wk_vol_m * 1_000_000)
+    )
+    tab_all, tab_known = st.tabs(
+        [f"🏆 All candidates ({len(df)})", f"⭐ Well-known ({int(known_mask.sum())})"]
+    )
+    with tab_all:
+        st.caption("RVOL = today's volume vs 20-day avg (>2 = unusual). 5d % = price change over 5 sessions. "
+                   "Click any column header to sort.")
+        if scan["first_scan"]:
+            st.caption("ℹ️ First scan this session — 🆕 'new' flags appear from your next scan onward.")
+        render_results(df[display_cols], key="all")
+    with tab_known:
+        known = df[known_mask]
+        st.caption(
+            f"Candidates with market cap ≥ ${wk_cap_m}M and avg daily $ volume ≥ "
+            f"${wk_vol_m}M — recognizable, liquid names. Tune the thresholds in the sidebar."
+        )
+        if known.empty:
+            st.info("No candidate cleared the 'well-known' thresholds. Household names "
+                    "are often larger than this screener's **Max market cap** filter — "
+                    "raise that slider (and/or lower the thresholds here) to include them.")
+        else:
+            render_results(known[display_cols], key="known")
+
+    st.caption(
+        "\\*Theme Score is a **speculative** Emerging-Theme heuristic (R&D-style "
+        "growth + margins + theme keywords + attention). It is **not a prediction** "
+        "of which products will succeed — expect many false positives. See `src/theme.py`."
+    )
+    with st.expander("Why these? (catalysts + Reddit context)"):
+        for c in candidates[:15]:
+            if c.catalyst_notes or c.sample_titles or c.theme_tags:
+                st.markdown(f"**{c.symbol}** — score {c.score} (catalyst {c.catalyst_score})")
+                if c.theme_tags:
+                    st.markdown(f"- 🌱 Theme(s): {', '.join(c.theme_tags)} "
+                                f"(speculative score {c.theme_score})")
+                for n in c.catalyst_notes:
+                    st.markdown(f"- 📄 SEC: {n}")
+                for t in c.sample_titles:
+                    st.markdown(f"- 💬 {t}")
+
+
 st.title("🚀 Small-Cap Rally Radar")
 st.caption(
     "Ranks small-cap stocks by how ready they look to **rally (go up)** — "
@@ -244,56 +303,22 @@ if run:
     df = pd.DataFrame(
         [candidate_row(c, is_new=c.symbol in new_symbols) for c in candidates]
     )
-    display_cols = display_columns(df)
 
-    # 'Well-known' = bigger + liquid (per the sidebar thresholds).
-    known_mask = (
-        (df["_mkt_cap"] >= wellknown_min_cap_m * 1_000_000)
-        & (df["_dollar_vol"] >= wellknown_min_dollar_vol_m * 1_000_000)
-    )
+    # Persist the result so it survives reruns (tab switches, minimize/reconnect).
+    # We store the raw data, not the rendered widgets, and re-render below.
+    st.session_state["scan"] = {
+        "df": df,
+        "candidates": candidates,
+        "n": len(candidates),
+        "no_fundamentals": no_fundamentals,
+        "first_scan": first_scan,
+    }
 
-    tab_all, tab_known = st.tabs(
-        [f"🏆 All candidates ({len(df)})", f"⭐ Well-known ({int(known_mask.sum())})"]
-    )
-
-    with tab_all:
-        st.caption("RVOL = today's volume vs 20-day avg (>2 = unusual). 5d % = price change over 5 sessions. "
-                   "Click any column header to sort.")
-        if first_scan:
-            st.caption("ℹ️ First scan this session — 🆕 'new' flags appear from your next scan onward.")
-        render_results(df[display_cols], key="all")
-
-    with tab_known:
-        known = df[known_mask]
-        st.caption(
-            f"Candidates with market cap ≥ ${wellknown_min_cap_m}M and avg daily "
-            f"$ volume ≥ ${wellknown_min_dollar_vol_m}M — recognizable, liquid names. "
-            "Tune the thresholds in the sidebar."
-        )
-        if known.empty:
-            st.info("No candidate cleared the 'well-known' thresholds. Household names "
-                    "are often larger than this screener's **Max market cap** filter — "
-                    "raise that slider (and/or lower the thresholds here) to include them.")
-        else:
-            render_results(known[display_cols], key="known")
-
-    st.caption(
-        "\\*Theme Score is a **speculative** Emerging-Theme heuristic (R&D-style "
-        "growth + margins + theme keywords + attention). It is **not a prediction** "
-        "of which products will succeed — expect many false positives. See `src/theme.py`."
-    )
-
-    with st.expander("Why these? (catalysts + Reddit context)"):
-        for c in candidates[:15]:
-            if c.catalyst_notes or c.sample_titles or c.theme_tags:
-                st.markdown(f"**{c.symbol}** — score {c.score} (catalyst {c.catalyst_score})")
-                if c.theme_tags:
-                    st.markdown(f"- 🌱 Theme(s): {', '.join(c.theme_tags)} "
-                                f"(speculative score {c.theme_score})")
-                for n in c.catalyst_notes:
-                    st.markdown(f"- 📄 SEC: {n}")
-                for t in c.sample_titles:
-                    st.markdown(f"- 💬 {t}")
-else:
+# Render the most recent scan on EVERY rerun (so results don't vanish when the
+# Scan button resets to False on reconnect). Falls back to the intro prompt.
+scan = st.session_state.get("scan")
+if scan is None:
     st.info("Set your watchlist + filters in the sidebar, then click **Scan for rallies**. "
             "First run downloads the ticker list (~1 min).")
+else:
+    _render_scan(scan, wellknown_min_cap_m, wellknown_min_dollar_vol_m)
