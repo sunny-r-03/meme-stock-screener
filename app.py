@@ -16,15 +16,15 @@ import pandas as pd
 import streamlit as st
 
 from src.breakout import Breakout, fetch as fetch_breakout
-from src.edgar import fetch as fetch_catalyst
+from src.edgar import Catalyst, fetch as fetch_catalyst
 from src.fundamentals import Fundamentals, fetch as fetch_fundamentals
 from src.apewisdom import scan as scan_social
-from src.market_scanner import scan_market
+from src.market_scanner import scan_all, filter_movers
 from src.scoring import build_candidate, WEIGHTS
 
 # Deep-analysis is pure network I/O, so fetch tickers concurrently. Kept modest
-# to stay friendly to yfinance/SEC rate limits while still cutting wall-clock ~6x.
-MAX_WORKERS = 6
+# to stay friendly to yfinance/SEC rate limits while still cutting wall-clock.
+MAX_WORKERS = 8
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -33,7 +33,14 @@ def _social_buzz(pages: int = 2):
     return scan_social(flt="all-stocks", pages=pages)
 
 
-def _gather(sym, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache):
+@st.cache_data(ttl=600, show_spinner=False)
+def _all_movers():
+    """The whole-market breakout download, cached 10 min. Filtering by the user's
+    sliders happens in-memory afterward, so slider tweaks don't re-download."""
+    return scan_all()
+
+
+def _gather(sym, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache, use_catalyst):
     """Fetch all per-ticker signals for one symbol. PURE + thread-safe: it only
     *reads* the cache dicts (never mutates them or st.session_state), so it's
     safe to run in a worker thread. The main thread writes results back."""
@@ -44,7 +51,10 @@ def _gather(sym, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache):
     else:
         b = breakout_cache.get(sym) or fetch_breakout(sym)
     f = fund_cache.get(sym) or fetch_fundamentals(sym)
-    cat = catalyst_cache.get(sym) or fetch_catalyst(sym)
+    if not use_catalyst:
+        cat = Catalyst(sym, 0.0, [], ok=False)
+    else:
+        cat = catalyst_cache.get(sym) or fetch_catalyst(sym)
     return sym, b, f, cat
 
 
@@ -153,6 +163,9 @@ with st.sidebar:
     )
     use_social = st.checkbox("Fold in social buzz (ApeWisdom — no setup)", value=True)
     add_trending = st.checkbox("Also treat trending social tickers as candidates", value=True)
+    use_catalyst = st.checkbox("Scan SEC for catalysts (slower)", value=True,
+                               help="Uncheck for a faster scan — skips the SEC EDGAR "
+                                    "filing lookups (Catalyst column shows 0).")
 
     st.header("Filters")
     max_market_cap_m = st.slider("Max market cap ($M)", 50, 50_000, 1000, step=50)
@@ -184,11 +197,13 @@ if run:
 
     movers_by_symbol: dict = {}
     if source.startswith("🌎"):
-        with st.spinner("Scanning the whole market for breakouts (~3-5 min)..."):
-            movers = scan_market(
-                max_price=max_price, min_rvol=min_rvol, min_ret_5d=min_ret_5d
-            )
-        st.success(f"Found {len(movers)} stocks breaking out market-wide.")
+        with st.spinner("Scanning the whole market for breakouts (first run ~1-2 min, then cached)..."):
+            all_movers = _all_movers()  # cached 10 min — only the first run pays
+        movers = filter_movers(
+            all_movers, max_price=max_price, min_rvol=min_rvol, min_ret_5d=min_ret_5d
+        )
+        st.success(f"Found {len(movers)} breaking out (filtered from {len(all_movers)} "
+                   "scanned market-wide; re-filtering is instant for 10 min).")
         movers = movers[:max_movers]
         movers_by_symbol = {m.symbol: m for m in movers}
         social_extra = list(buzz_by_symbol) if add_trending else []
@@ -216,7 +231,8 @@ if run:
     prog = st.progress(0.0, text="Pulling data...")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {
-            ex.submit(_gather, s, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache): s
+            ex.submit(_gather, s, movers_by_symbol, fund_cache, breakout_cache,
+                      catalyst_cache, use_catalyst): s
             for s in symbols
         }
         for done, fut in enumerate(as_completed(futures)):
@@ -227,7 +243,8 @@ if run:
                 breakout_cache[sym] = b
             if f.ok:
                 fund_cache[sym] = f
-            catalyst_cache.setdefault(sym, cat)
+            if use_catalyst:  # don't cache the skipped/zero catalyst
+                catalyst_cache.setdefault(sym, cat)
             prog.progress((done + 1) / len(symbols), text=f"Analyzed {done + 1}/{len(symbols)}...")
     prog.empty()
 

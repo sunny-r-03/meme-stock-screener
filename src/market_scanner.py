@@ -10,6 +10,7 @@ the caller for just these movers — not all 12,000 names.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -75,37 +76,74 @@ def _scan_chunk(symbols: list[str]) -> list[Mover]:
     return movers
 
 
-def scan_market(
-    max_price: float = 50.0,
-    min_rvol: float = 2.0,
-    min_ret_5d: float = 5.0,
-    min_dollar_vol: float = 250_000.0,
+# Loosest thresholds the UI sliders can request. scan_all() keeps everything
+# clearing these, so any *tighter* slider combination filters purely in-memory
+# (no re-download). Keep in sync with the sliders' min/max in app.py.
+FLOOR_RVOL = 1.5
+FLOOR_RET_5D = 0.0
+CEIL_PRICE = 200.0
+MIN_DOLLAR_VOL = 250_000.0
+
+
+def scan_all(
     chunk_size: int = 200,
+    max_workers: int = 4,
     limit_symbols: int | None = None,
 ) -> list[Mover]:
-    """Scan the universe and return tickers that are breaking out.
+    """Download breakout metrics for the WHOLE universe and return every mover
+    clearing the loosest UI thresholds. This is the expensive step (the bulk
+    yfinance download); chunks are fetched concurrently. Cache it once, then
+    slice cheaply with filter_movers() — re-runs/slider tweaks cost nothing.
 
-    Filters:
-      - max_price       keep small/affordable names (where rallies are explosive)
-      - min_rvol        unusual volume = something is happening
-      - min_ret_5d      already moving up
-      - min_dollar_vol  tradeable (not a dead ticker)
+    `max_workers` is deliberately small: yfinance already threads *within* each
+    chunk, so stacking too many concurrent chunks invites Yahoo rate-limiting.
     """
     symbols = list(load_universe()["symbol"])
     if limit_symbols:
         symbols = symbols[:limit_symbols]
+    chunks = [symbols[i : i + chunk_size] for i in range(0, len(symbols), chunk_size)]
 
     results: list[Mover] = []
-    for i in range(0, len(symbols), chunk_size):
-        chunk = symbols[i : i + chunk_size]
-        for m in _scan_chunk(chunk):
-            if (
-                m.last_close <= max_price
-                and m.rvol >= min_rvol
-                and m.ret_5d >= min_ret_5d
-                and m.avg_dollar_vol >= min_dollar_vol
-            ):
-                results.append(m)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for movers in ex.map(_scan_chunk, chunks):
+            for m in movers:
+                if (
+                    m.last_close <= CEIL_PRICE
+                    and m.rvol >= FLOOR_RVOL
+                    and m.ret_5d >= FLOOR_RET_5D
+                    and m.avg_dollar_vol >= MIN_DOLLAR_VOL
+                ):
+                    results.append(m)
 
     results.sort(key=lambda m: (m.rvol, m.ret_5d), reverse=True)
     return results
+
+
+def filter_movers(
+    movers: list[Mover],
+    max_price: float = 50.0,
+    min_rvol: float = 2.0,
+    min_ret_5d: float = 5.0,
+    min_dollar_vol: float = MIN_DOLLAR_VOL,
+) -> list[Mover]:
+    """Cheap, network-free filter over already-downloaded movers."""
+    return [
+        m for m in movers
+        if m.last_close <= max_price
+        and m.rvol >= min_rvol
+        and m.ret_5d >= min_ret_5d
+        and m.avg_dollar_vol >= min_dollar_vol
+    ]
+
+
+def scan_market(
+    max_price: float = 50.0,
+    min_rvol: float = 2.0,
+    min_ret_5d: float = 5.0,
+    min_dollar_vol: float = MIN_DOLLAR_VOL,
+    chunk_size: int = 200,
+    limit_symbols: int | None = None,
+) -> list[Mover]:
+    """Download + filter in one call (kept for tests / back-compat)."""
+    movers = scan_all(chunk_size=chunk_size, limit_symbols=limit_symbols)
+    return filter_movers(movers, max_price, min_rvol, min_ret_5d, min_dollar_vol)
