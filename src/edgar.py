@@ -20,7 +20,9 @@ Uses two free, key-less SEC endpoints (a descriptive User-Agent is required):
 """
 from __future__ import annotations
 
+import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -35,6 +37,49 @@ HEADERS = {
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 TICKER_MAP_FILE = os.path.join(CACHE_DIR, "sec_ticker_cik.json")
+
+# Disk cache for computed catalyst scores. Filings change slowly, so a daily TTL
+# means re-runs and app restarts reuse results instead of re-hitting SEC.
+CATALYST_CACHE_FILE = os.path.join(CACHE_DIR, "catalyst_cache.json")
+CATALYST_TTL_SECONDS = 24 * 3600
+_cache_lock = threading.Lock()  # fetch() runs in worker threads — guard the file
+_catalyst_cache: dict | None = None  # lazily loaded {SYM: {score, notes, ok, lookback, ts}}
+
+
+def _load_catalyst_cache() -> dict:
+    global _catalyst_cache
+    if _catalyst_cache is None:
+        try:
+            with open(CATALYST_CACHE_FILE) as fh:
+                _catalyst_cache = json.load(fh)
+        except Exception:
+            _catalyst_cache = {}
+    return _catalyst_cache
+
+
+def _cache_get(symbol: str, lookback_days: int):
+    with _cache_lock:
+        entry = _load_catalyst_cache().get(symbol)
+        if (entry and entry.get("lookback") == lookback_days
+                and (time.time() - entry.get("ts", 0)) < CATALYST_TTL_SECONDS):
+            return Catalyst(symbol, entry["score"], list(entry.get("notes", [])),
+                            ok=entry.get("ok", True))
+    return None
+
+
+def _cache_put(symbol: str, cat: "Catalyst", lookback_days: int) -> None:
+    with _cache_lock:
+        cache = _load_catalyst_cache()
+        cache[symbol] = {"score": cat.score, "notes": cat.notes, "ok": cat.ok,
+                         "lookback": lookback_days, "ts": time.time()}
+        try:  # atomic write so a crash mid-write can't corrupt the cache
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            tmp = CATALYST_CACHE_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(cache, fh)
+            os.replace(tmp, CATALYST_CACHE_FILE)
+        except Exception:
+            pass
 
 # Recent bullish catalysts -> points.
 BULLISH = {
@@ -89,15 +134,16 @@ def _ticker_cik_map() -> dict[str, str]:
         return {}
 
 
-def _recent_filings(cik: str, lookback_days: int) -> list[tuple[str, str]]:
-    """Return [(form, filingDate)] filed within lookback_days."""
+def _recent_filings(cik: str, lookback_days: int) -> list[tuple[str, str]] | None:
+    """Return [(form, filingDate)] filed within lookback_days, or None on a
+    transient request failure (so the caller can avoid caching a bad result)."""
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
         recent = resp.json().get("filings", {}).get("recent", {})
     except Exception:
-        return []
+        return None
     forms = recent.get("form", [])
     dates = recent.get("filingDate", [])
     cutoff = datetime.now() - timedelta(days=lookback_days)
@@ -112,13 +158,26 @@ def _recent_filings(cik: str, lookback_days: int) -> list[tuple[str, str]]:
 
 
 def fetch(symbol: str, lookback_days: int = 120) -> Catalyst:
-    """Score recent SEC filings for catalyst strength (minus dilution risk)."""
-    cik = _ticker_cik_map().get(symbol.upper())
+    """Score recent SEC filings for catalyst strength (minus dilution risk).
+
+    Results are cached to disk (daily TTL) so re-runs and restarts skip the SEC
+    round-trip. Transient SEC failures are NOT cached, so they retry next time.
+    """
+    symbol = symbol.upper()
+    cached = _cache_get(symbol, lookback_days)
+    if cached is not None:
+        return cached
+
+    cik = _ticker_cik_map().get(symbol)
     if not cik:
-        return Catalyst(symbol, 0.0, ["no SEC CIK found"], ok=False)
+        result = Catalyst(symbol, 0.0, ["no SEC CIK found"], ok=False)
+        _cache_put(symbol, result, lookback_days)  # stable; safe to cache
+        return result
 
     filings = _recent_filings(cik, lookback_days)
     time.sleep(0.12)  # stay well under SEC's 10 req/sec limit
+    if filings is None:  # transient failure — return uncached so it retries
+        return Catalyst(symbol, 0.0, ["SEC fetch failed (will retry)"], ok=False)
 
     # Count each form type only ONCE so a pile of routine 8-Ks can't dominate a
     # rare, high-signal activist 13D. We keep the most recent date per form.
@@ -144,4 +203,6 @@ def fetch(symbol: str, lookback_days: int = 120) -> Catalyst:
             notes.append(f"-{form} dilution ({date})")
 
     score = max(0.0, min(points - penalty, 100.0))
-    return Catalyst(symbol, round(score, 1), notes, ok=True)
+    result = Catalyst(symbol, round(score, 1), notes, ok=True)
+    _cache_put(symbol, result, lookback_days)
+    return result

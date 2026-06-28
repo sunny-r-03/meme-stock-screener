@@ -15,6 +15,7 @@ __pycache__/
 # Cached ticker universe / scan artifacts
 *.cache
 data/cache/
+data/catalyst_cache.json
 
 # OS / editor
 .DS_Store
