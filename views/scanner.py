@@ -371,6 +371,8 @@ scan = st.session_state.get("scan") or _load_last_scan()
 if scan is None:
     st.info("Set your watchlist + filters in the sidebar, then click **Scan for rallies**. "
             "First run downloads the ticker list (~1 min).")
+    st.markdown("👉 Want results right now? See the pre-computed leaderboard:")
+    st.page_link("views/daily_top10.py", label="🏆 Daily Top 10", icon="🏆")
 else:
     st.session_state.setdefault("scan", scan)
     _render_scan(scan, wellknown_min_cap_m, wellknown_min_dollar_vol_m)
