@@ -8,9 +8,12 @@ Educational tool, NOT financial advice. Most candidates will not rally.
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -79,16 +82,44 @@ def _gather(sym, movers_by_symbol, use_catalyst):
     return sym, b, f, cat
 
 
+LAST_SCAN_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "last_scan.json")
+
+
+def _save_last_scan(scan: dict) -> None:
+    """Persist the last scan to disk so a hard refresh / reopen reloads it
+    instantly (no re-scan). JSON-clean: `records`/`explain` hold only plain
+    dicts. Best-effort — a write failure never breaks the scan."""
+    try:
+        os.makedirs(os.path.dirname(LAST_SCAN_FILE), exist_ok=True)
+        tmp = LAST_SCAN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(scan, fh)
+        os.replace(tmp, LAST_SCAN_FILE)
+    except Exception:
+        pass
+
+
+def _load_last_scan() -> dict | None:
+    try:
+        with open(LAST_SCAN_FILE, encoding="utf-8") as fh:
+            scan = json.load(fh)
+        return scan if scan.get("records") else None
+    except Exception:
+        return None
+
+
 def _render_scan(scan: dict, wk_cap_m: float, wk_vol_m: float) -> None:
-    """Render a stored scan result. Reads from session_state, so it repaints on
-    ANY rerun (tab switch, minimize/reconnect, well-known slider change) without
-    re-running the scan — your results don't vanish when the page reloads."""
-    df = scan["df"]
-    candidates = scan["candidates"]
+    """Render a stored scan result from plain dicts (so it works whether the scan
+    came from this session OR was reloaded from disk on refresh/reopen). Repaints
+    on ANY rerun without re-scanning — results don't vanish when the page reloads."""
+    df = pd.DataFrame(scan["records"])
+    explain = scan.get("explain", [])
     display_cols = display_columns(df)
 
-    st.caption(f"🕒 Showing your last scan ({scan['n']} candidates). Results persist "
-               "across tab switches and reconnects — click **Scan for rallies** to refresh.")
+    when = scan.get("generated_at", "")
+    st.caption(f"🕒 Showing the most recent scan ({scan['n']} candidates"
+               + (f", run {when} UTC" if when else "")
+               + "). Loads instantly on refresh — click **Scan for rallies** to run a fresh one.")
     if scan["no_fundamentals"]:
         st.info(f"⚠️ yfinance rate-limited fundamentals for {scan['no_fundamentals']} ticker(s) — "
                 "those are scored on breakout only (float/short/cap blank). Re-scan for full data.")
@@ -126,15 +157,15 @@ def _render_scan(scan: dict, wk_cap_m: float, wk_vol_m: float) -> None:
         "of which products will succeed — expect many false positives. See `src/theme.py`."
     )
     with st.expander("Why these? (catalysts + Reddit context)"):
-        for c in candidates[:15]:
-            if c.catalyst_notes or c.sample_titles or c.theme_tags:
-                st.markdown(f"**{c.symbol}** — score {c.score} (catalyst {c.catalyst_score})")
-                if c.theme_tags:
-                    st.markdown(f"- 🌱 Theme(s): {', '.join(c.theme_tags)} "
-                                f"(speculative score {c.theme_score})")
-                for n in c.catalyst_notes:
+        for e in explain:
+            if e.get("catalyst_notes") or e.get("sample_titles") or e.get("theme_tags"):
+                st.markdown(f"**{e['symbol']}** — score {e['score']} (catalyst {e['catalyst_score']})")
+                if e.get("theme_tags"):
+                    st.markdown(f"- 🌱 Theme(s): {', '.join(e['theme_tags'])} "
+                                f"(speculative score {e['theme_score']})")
+                for n in e.get("catalyst_notes", []):
                     st.markdown(f"- 📄 SEC: {n}")
-                for t in c.sample_titles:
+                for t in e.get("sample_titles", []):
                     st.markdown(f"- 💬 {t}")
 
 
@@ -311,25 +342,35 @@ if run:
     first_scan = prev_symbols is None
     st.session_state["prev_scan_symbols"] = current_symbols
 
-    df = pd.DataFrame(
-        [candidate_row(c, is_new=c.symbol in new_symbols) for c in candidates]
-    )
-
-    # Persist the result so it survives reruns (tab switches, minimize/reconnect).
-    # We store the raw data, not the rendered widgets, and re-render below.
-    st.session_state["scan"] = {
-        "df": df,
-        "candidates": candidates,
+    # Build JSON-clean payload (plain dicts) so the SAME structure works for
+    # in-session re-rendering AND disk persistence across refresh/reopen.
+    records = [candidate_row(c, is_new=c.symbol in new_symbols) for c in candidates]
+    explain = [
+        {
+            "symbol": c.symbol, "score": c.score, "catalyst_score": c.catalyst_score,
+            "theme_tags": c.theme_tags, "theme_score": c.theme_score,
+            "catalyst_notes": c.catalyst_notes, "sample_titles": c.sample_titles,
+        }
+        for c in candidates[:15]
+    ]
+    scan = {
+        "records": records,
+        "explain": explain,
         "n": len(candidates),
         "no_fundamentals": no_fundamentals,
         "first_scan": first_scan,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
     }
+    st.session_state["scan"] = scan   # survives reruns (tab switch, reconnect)
+    _save_last_scan(scan)             # survives hard refresh / reopen
 
 # Render the most recent scan on EVERY rerun (so results don't vanish when the
-# Scan button resets to False on reconnect). Falls back to the intro prompt.
-scan = st.session_state.get("scan")
+# Scan button resets to False). On a fresh session (refresh/reopen) there's no
+# session scan, so fall back to the last scan persisted on disk — instant load.
+scan = st.session_state.get("scan") or _load_last_scan()
 if scan is None:
     st.info("Set your watchlist + filters in the sidebar, then click **Scan for rallies**. "
             "First run downloads the ticker list (~1 min).")
 else:
+    st.session_state.setdefault("scan", scan)
     _render_scan(scan, wellknown_min_cap_m, wellknown_min_dollar_vol_m)

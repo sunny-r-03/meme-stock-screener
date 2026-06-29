@@ -16,6 +16,7 @@ __pycache__/
 *.cache
 data/cache/
 data/catalyst_cache.json
+data/last_scan.json
 
 # OS / editor
 .DS_Store
