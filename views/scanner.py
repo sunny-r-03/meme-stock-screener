@@ -8,6 +8,8 @@ Educational tool, NOT financial advice. Most candidates will not rally.
 """
 from __future__ import annotations
 
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -39,21 +41,41 @@ def _all_movers():
     return scan_all()
 
 
-def _gather(sym, movers_by_symbol, fund_cache, breakout_cache, catalyst_cache, use_catalyst):
-    """Fetch all per-ticker signals for one symbol. PURE + thread-safe: it only
-    *reads* the cache dicts (never mutates them or st.session_state), so it's
-    safe to run in a worker thread. The main thread writes results back."""
+# Process-global per-ticker cache (lives in the app process, SHARED across all
+# user sessions and reruns — so a full session reset still re-scans in seconds,
+# not minutes). Thread-safe, so the worker threads can use it directly. Only
+# successful fetches are cached; entries expire after _CACHE_TTL.
+_CACHE_TTL = 900  # 15 minutes — fresh enough for intraday, avoids re-hammering APIs
+_cache_lock = threading.Lock()
+_fund_cache: dict = {}      # sym -> (timestamp, Fundamentals)
+_breakout_cache: dict = {}  # sym -> (timestamp, Breakout)
+
+
+def _cached(cache: dict, sym: str, fetch_fn):
+    now = time.time()
+    with _cache_lock:
+        hit = cache.get(sym)
+        if hit and now - hit[0] < _CACHE_TTL:
+            return hit[1]
+    result = fetch_fn(sym)
+    if getattr(result, "ok", False):
+        with _cache_lock:
+            cache[sym] = (now, result)
+    return result
+
+
+def _gather(sym, movers_by_symbol, use_catalyst):
+    """Fetch all per-ticker signals for one symbol. Thread-safe: the caches it
+    touches are process-global and lock-guarded, so it's safe in a worker thread
+    and its results survive session resets. Catalyst is disk-cached in edgar.py."""
     mv = movers_by_symbol.get(sym)
     if mv is not None:  # reuse the market-scan breakout — no extra network call
         b = Breakout(sym, mv.rvol, None, mv.ret_5d, mv.pct_of_high, mv.last_close,
                      ok=True, closes=mv.closes)
     else:
-        b = breakout_cache.get(sym) or fetch_breakout(sym)
-    f = fund_cache.get(sym) or fetch_fundamentals(sym)
-    if not use_catalyst:
-        cat = Catalyst(sym, 0.0, [], ok=False)
-    else:
-        cat = catalyst_cache.get(sym) or fetch_catalyst(sym)
+        b = _cached(_breakout_cache, sym, fetch_breakout)
+    f = _cached(_fund_cache, sym, fetch_fundamentals)
+    cat = Catalyst(sym, 0.0, [], ok=False) if not use_catalyst else fetch_catalyst(sym)
     return sym, b, f, cat
 
 
@@ -232,30 +254,19 @@ if run:
     max_momentum = max((b.momentum for b in buzz_by_symbol.values()), default=1.0)
 
     # 2) Fetch every candidate's signals CONCURRENTLY (pure network I/O), then
-    #    assemble on the main thread. yfinance .info can rate-limit, so we degrade
+    #    assemble on the main thread. Caching lives inside _gather (process-global,
+    #    survives session resets). yfinance .info can rate-limit, so we degrade
     #    gracefully: a candidate is kept and scored on whatever data we DO have.
-    fund_cache = st.session_state.setdefault("fund_cache", {})
-    breakout_cache = st.session_state.setdefault("breakout_cache", {})
-    catalyst_cache = st.session_state.setdefault("catalyst_cache", {})
-
     fetched: dict = {}
     prog = st.progress(0.0, text="Pulling data...")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {
-            ex.submit(_gather, s, movers_by_symbol, fund_cache, breakout_cache,
-                      catalyst_cache, use_catalyst): s
+            ex.submit(_gather, s, movers_by_symbol, use_catalyst): s
             for s in symbols
         }
         for done, fut in enumerate(as_completed(futures)):
             sym, b, f, cat = fut.result()
             fetched[sym] = (b, f, cat)
-            # Cache successes so a re-run reuses them (failures retried next time).
-            if b.ok:
-                breakout_cache[sym] = b
-            if f.ok:
-                fund_cache[sym] = f
-            if use_catalyst:  # don't cache the skipped/zero catalyst
-                catalyst_cache.setdefault(sym, cat)
             prog.progress((done + 1) / len(symbols), text=f"Analyzed {done + 1}/{len(symbols)}...")
     prog.empty()
 
